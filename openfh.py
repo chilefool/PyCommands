@@ -1,63 +1,71 @@
 #!/usr/bin/env python
 """
-Immunity Debugger PyCommand that opens a file handle under the debugged process
+PyCommand that opens a file handle under the debugged process
 
-Author: bobby@strayprocess.com
-
-Usage: Place within PyCommands directory and type "!openfh <path_to_file>" in
-  the command bar in order to open a file handle for that file.  The new file
-  handle will be shown in the message box at the bottom of the window and
-  additional details will be written to the Log window (Alt + L). Registers and
-  CPU status flags should all be preserved.
-
-Revision History:
-  11/15/2009, v1.0 - Initial public release
-
+Place within PyCommands directory and type "!openfh <path_to_file>" in
+the command bar in order to open a file handle for that file.  The new file
+handle will be shown in the message box at the bottom of the window and
+additional details will be written to the Log window (Alt + L). Registers
+and CPU status flags should all be preserved.
 """
-
-__VERSION__ = '1.0'
-
 import immlib
-from immutils import *
+import immutils
 
-DESC= "Open a file handle under the debugged process"
+__VERSION__ = '1.1'
+NAME = 'openfh'
+DESC = 'Open a file handle under the debugged process'
+COPYRIGHT = 'Copyright (c) 2009-2017 Bobby Noell'
+LICENSE = 'MIT'
 
-# find an unused section of memory that we can write code to
-def find_memory_addr(imm, size):
+INVALID_HANDLE_VALUE = -1
+
+
+def find_unused_memory(imm, size):
+    """Find `size` bytes of unused executable memory
+
+    :param imm: Debugger instance
+    :param size: length of memory to find
+    :return: memory address
+    :raise: RuntimeError if not found
+    """
     cave = '\x00' * size
     mod = imm.getModule(imm.getDebuggedName())
-    pages = imm.getMemoryPagebyOwnerAddress(mod.getBase())
+    pages = imm.getMemoryPageByOwnerAddress(mod.getBase())
     for page in pages:
-        addr = page.search(cave)
-        if addr:
-            return addr[0]
-    return 0
+        if immlib.PageFlags[page.getAccess()].find('E') >= 0:
+            addr = page.search(cave)
+            if addr:
+                return addr[-1]
+    raise RuntimeError('A suitable code cave was not found :-(')
 
-# use CreateFileA to open a file handle for filename
+
 def createfile(imm, filename):
-    # get address of CreateFileA
-    createfile_addr = imm.getAddress("kernel32.CreateFileA")
-    if(createfile_addr <= 0):
-        imm.Log("  Error: kernel32.CreateFileA not found", gray=True)
-        return "Error: kernel32.CreateFileA not found"
-    imm.Log("  kernel32.CreateFileA found at 0x%08x" % createfile_addr, gray=True)
-    
-    shellcode_size = 0x25
-    mem_addr = find_memory_addr(imm, shellcode_size + len(filename))
-    if not mem_addr:
-        imm.Log("  Error: a suitable code cave was not found :-(", gray=True)
-        return "Error: a suitable code cave was not found :-("
-    
-    filename_offset = mem_addr + shellcode_size
-    createfile_offset = createfile_addr - mem_addr - shellcode_size + 6 # 6 = PushFD + Jmp rel32
+    """Use kernel32.CreateFileA to open a file handle for `filename`
 
-    # save registers and calculate offset for Jmp back to origin
+    :param imm: Debugger instance
+    :param filename: path to file
+    :return: file handle
+    :raise: RuntimeError on error
+    """
+    # get address of CreateFileA
+    createfile_addr = imm.getAddress('kernel32.CreateFileA')
+    if createfile_addr <= 0:
+        raise RuntimeError('Unable to find kernel32.CreateFileA')
+    imm.log('  kernel32.CreateFileA found at 0x{:08x}'.format(createfile_addr), gray=True)
+
+    # Find an unused section of executable memory that we can write code to
+    shellcode_size = 0x26
+    filename += '\0'
+    cave_size = shellcode_size + len(filename)
+    mem_addr = find_unused_memory(imm, cave_size)
+    filename_offset = mem_addr + shellcode_size
+    createfile_offset = createfile_addr - mem_addr - shellcode_size + 7  # 7 = PopFD+Push imm32+Retn
+
+    # save registers
     old_regs = imm.getRegs()
-    origin_offset = sint32(old_regs['EIP'] - filename_offset)
-    
-    imm.Log("  Writing %d bytes to code cave at 0x%08x" % (shellcode_size + \
-        len(filename), mem_addr), gray=True)
-    
+
+    imm.log('  Writing {} bytes to code cave at 0x{:08x}'.format(cave_size, mem_addr), gray=True)
+
     # assemble the call to CreateFileA and write to our memory location
     # CreateFileA(
     #   FileName = <filename>
@@ -67,8 +75,8 @@ def createfile(imm, filename):
     #   Mode = OPEN_EXISTING
     #   Attributes = NORMAL
     #   TemplateFile = NULL
-    #)
-    asm = " \
+    # )
+    asm = ' \
         PushFD                             \n\
         Xor     EAX, EAX                   \n\
         Push    EAX                        \n\
@@ -77,56 +85,59 @@ def createfile(imm, filename):
         Push    EAX                        \n\
         Push    EAX                        \n\
         Push    0xC0000000                 \n\
-        Push    0x%08x                     \n\
-        Call    0x%08x                     \n\
+        Push    0x{:08x}                   \n\
+        Call    0x{:08x}                   \n\
         PopFD                              \n\
-        DB     0xE9                        \n\
-        DD     0x%08x                      \n\
-    " % (filename_offset, createfile_offset, origin_offset)
-    imm.writeMemory(mem_addr, imm.Assemble(asm))
+        Push    0x{:08x}                   \n\
+        Retn                               \n\
+    '.format(filename_offset, createfile_offset, old_regs['EIP'])
+    imm.writeMemory(mem_addr, imm.assemble(asm))
     # write the filename directly after our assembled code
     imm.writeMemory(filename_offset, filename)
-    
-    # go to injected code and execute
+
+    # manually set EIP to injected code and execute
+    imm.log('  Executing call to kernel32.CreateFileA', gray=True)
     imm.setReg('EIP', mem_addr)
-    imm.stepIn() # Run(addr) doesn't seem to work right sometimes without stepping first????
-    imm.Run(old_regs['EIP'])
-    
+    imm.goSilent(True)
+    imm.run(old_regs['EIP'])
+    imm.goSilent(False)
+
     # save our file handle
     file_handle = imm.getRegs()['EAX']
-    
+
     # restore registers
     for reg in old_regs:
         imm.setReg(reg, old_regs[reg])
-    
-    return sint32(file_handle)
-    
-def main(args): 
-    imm = immlib.Debugger()
-    imm.Log("")
-    if not args:
-        imm.Log("[ !openfh ]")
-        imm.Log("  Usage: !openfh <path_to_file>", gray=True)
-        return "Usage: !openfh <path_to_file>"
-    imm.Log("[ !openfh -- %s ]" % args[0])
-    filename = args[0]+"\0"
 
-    # make sure kernel32.dll is loaded
-    mod = imm.getModule("kernel32.dll")
-    if not mod:
-        imm.Log("  Error: kernel32.dll not found", gray=True)
-        return "Error: kernel32.dll not found"   
-    
-    # attempt to open a file handle
-    file_handle = createfile(imm, filename)
-    
-    if file_handle <= 0:
-        imm.Log("  Call to CreateFile failed", gray=True)
-        return "Error opening file handle"
-    imm.Log("  Opened file handle %xh (%dd)" % (file_handle, file_handle), gray=True)
-    return "File handle: %xh (%dd)" % (file_handle, file_handle)
-    
-    
-if __name__=="__main__":
-    print "This module is for use within Immunity Debugger only" 
-        
+    # restore memory
+    imm.log('  Restoring {} NULL bytes to 0x{:08x}'.format(cave_size, mem_addr), gray=True)
+    imm.writeMemory(mem_addr, '\x00' * cave_size)
+
+    return immutils.sint32(file_handle)
+
+
+def main(args):
+    """PyCommand that opens a file handle under the debugged process
+
+    :param args: arguments passed to the PyCommand
+    :return: status string
+    """
+    imm = immlib.Debugger()
+    imm.log('')
+    if not args:
+        imm.log('[ !openfh ]')
+        return 'Usage: !openfh <path_to_file>'
+    imm.log('[ !openfh -- {} ]'.format(args[0]))
+
+    try:
+        file_handle = createfile(imm, args[0])
+    except RuntimeError as exception:
+        return 'Error: {}'.format(exception.message)
+
+    if file_handle == INVALID_HANDLE_VALUE:
+        return 'Error opening file handle'
+
+    return 'File handle opened for {}: {:x}h ({}d)'.format(args[0], file_handle, file_handle)
+
+if __name__ == '__main__':
+    print 'This module is for use within Immunity Debugger only'
